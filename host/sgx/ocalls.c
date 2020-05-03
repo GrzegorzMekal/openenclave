@@ -41,13 +41,13 @@ void HandleThreadWait(oe_enclave_t* enclave, uint64_t arg_in)
 
 #if defined(__linux__)
 
-    if (__sync_fetch_and_add(&event->value, (uint32_t)-1) == 0)
+    if (__sync_fetch_and_add(&event->lock, (uint32_t)-1) == 0)
     {
         do
         {
             syscall(
                 __NR_futex,
-                &event->value,
+                &event->lock,
                 FUTEX_WAIT_PRIVATE,
                 -1,
                 NULL,
@@ -57,12 +57,29 @@ void HandleThreadWait(oe_enclave_t* enclave, uint64_t arg_in)
             // Spurious-wakes are ignored by going back to FUTEX_WAIT.
             // Since FUTEX_WAIT uses atomic instructions to load event->value,
             // it is safe to use a non-atomic operation here.
-        } while (event->value == (uint32_t)-1);
+        } while (event->lock == (uint32_t)-1);
     }
 
 #elif defined(_WIN32)
 
-    WaitForSingleObject(event->handle, INFINITE);
+    uint32_t LOCK_IS_FREE = 0;
+    uint32_t LOCK_IS_TAKEN = 1;
+
+    // Change the event to LOCK_IS_TAKEN from LOCK_IS_FREE.
+    if (_InterlockedCompareExchange(
+            &event->lock, LOCK_IS_TAKEN, LOCK_IS_FREE) == LOCK_IS_FREE)
+    {
+        // Notify the wake that now LOCK_IS_TAKEN.
+        WakeByAddressAll((void*)&event->lock);
+
+        // Waiting while event is LOCK_IS_TAKEN.
+        // Add a loop in case of fake waking.
+        do
+        {
+            WaitOnAddress(
+                &event->lock, &LOCK_IS_TAKEN, sizeof(event->lock), INFINITE);
+        } while (event->lock == LOCK_IS_TAKEN);
+    }
 
 #endif
 }
@@ -75,13 +92,33 @@ void HandleThreadWake(oe_enclave_t* enclave, uint64_t arg_in)
 
 #if defined(__linux__)
 
-    if (__sync_fetch_and_add(&event->value, 1) != 0)
-        syscall(
-            __NR_futex, &event->value, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    if (__sync_fetch_and_add(&event->lock, 1) != 0)
+    {
+        syscall(__NR_futex, &event->lock, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    }
 
 #elif defined(_WIN32)
 
-    SetEvent(event->handle);
+    uint32_t LOCK_IS_FREE = 0;
+    uint32_t LOCK_IS_TAKEN = 1;
+
+    // In case wake is earlier than wait and wait misses wake, wake must start
+    // later than wait.
+    // User also must pair this wake with a wait so this loop can end.
+    // User should also start wait earlier than wake, to guarante this is a
+    // rare case and then no extra performance lost.
+    while (event->lock == LOCK_IS_FREE)
+    {
+        WaitOnAddress(&event->lock, &LOCK_IS_FREE, sizeof(event->lock), 1000);
+    }
+
+    // If event is LOCK_IS_TAKEN, change it to LOCK_IS_FREE,
+    // then notify the waiting thread.
+    if (_InterlockedCompareExchange(
+            &event->lock, LOCK_IS_FREE, LOCK_IS_TAKEN) == LOCK_IS_TAKEN)
+    {
+        WakeByAddressAll((void*)&event->lock);
+    }
 
 #endif
 }
